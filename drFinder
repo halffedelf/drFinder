@@ -1,0 +1,144 @@
+#!/usr/bin/perl -w
+use strict;
+use Getopt::Std;
+use Bio::DB::Fasta;
+my %opt;
+getopts("a:r:s:e:m:f:l:R:d:",\%opt);
+use Cwd 'abs_path';
+my $script_location = abs_path($0);
+my @script_location_arr = split /\//, abs_path($0);
+pop @script_location_arr;
+my $script_dir = join ("/", @script_location_arr);
+ 
+#This script will find direct repeats in flanking of a given region
+my $usage= qq(
+This script will find direct repeats in flanking of a given genomic region.
+ 
+Author : musa:lianglab
+Date   : 2013-06-24
+ 
+Usage :  $0 -a genomeAssembly -r range -s flankingSize -e evalue -m similarityCutoff -h help -f inputFileFormat -l cutoffTargetLocus inputFile outputFile
+Input: gvf or bed [default gvf, if used bed, must be indicated in the options]
+ 
+Options:
+-a    Genome assembly [hg19/pt3/pa2], default hg19
+-r    [f]lanking or flanking+[t]arget, default f
+-s    maximum flanking region to consider, default 300
+-e    Evalue for the alignment as in 10e-value, default 5
+-m    Minimum percent similarity between the flankings, default 70
+-f    input file format [bed/gvf], default gvf
+-l    minimum length of target locus, 0 for not filtering. default 0
+-R    allows reverse complement between repeat pairs [t/f], default f
+-d    maximum bp difference allowed between the distances of two repeats from the breakpoints on both sides, default 5
+-h    this menu
+                  \n);
+ 
+die "$usage" if !@ARGV;
+#perse from config files
+open (CON, "<$script_dir/config.drfinder") or die "Failed to open the config file\n";
+my ($locate_hg19, $locate_pt3, $locate_pa2, $locate_bl2seq);
+$locate_hg19 = <CON>; chomp $locate_hg19;
+<CON>;
+$locate_pt3 = <CON>; chomp $locate_pt3;
+<CON>;
+$locate_pa2 = <CON>; chomp $locate_pa2;
+<CON>;
+$locate_bl2seq = <CON>; chomp $locate_bl2seq;
+close CON;
+#parsing complete
+ 
+my $infile = $ARGV[0]; #has to be a bed/gff/gvf file
+my $outfile = $ARGV[1];
+#load genome
+my $assembly = $opt{a}?$opt{a}:"hg19";
+$assembly=lc $assembly;
+my $db; #creating object for the reference seq
+if ($assembly eq "hg19"){
+    $db = Bio::DB::Fasta->new('$locate_hg19');
+} elsif ($assembly eq "pt3"){
+    $db = Bio::DB::Fasta->new('$locate_pt3');
+} elsif ($assembly eq "pa2"){
+    $db = Bio::DB::Fasta->new('$locate_pa2');
+} else {
+    die "$usage";
+}
+my $range="flanking";
+if ($opt{r}){
+    $range=$opt{r} eq "f"?"flanking":"all";
+}
+my $bp=$opt{s}?$opt{s}:300;         #the length of flanking to consider
+my $evalue=$opt{e}?$opt{e}:5;     #default evalue is 10e-5
+my $similarity=$opt{m}?$opt{m}:70;         #cutoff %similarity between the DRs
+my $format=$opt{f}?$opt{f}:"gvf";     #default file format is gvf
+my $minlen = $opt{l}?$opt{l}:0;
+my $R = $opt{R}?$opt{R}:"f";
+if ($R ne "f" || $R ne "t"){$R = "f";}
+my $distance_disparity = $opt{d}?$opt{d}:5;
+open (IN, "<$infile") or die "input file not found: $!\n";
+open (OUT, ">$outfile") or die;
+while (<IN>){
+    chomp;
+    my ($chr,$s,$e,$id);
+    if ($format eq "gvf"){
+        my ($f0,$f1,$f2,$f3,$f4,$f5,$f6,$f7,$f8) = split /\t/;
+        my @f8arr = split /[\;=]/,$f8;
+        $id = $f8arr[1];
+        $chr = $f0; $s=$f3; $e=$f4;
+    } elsif ($format eq "bed"){
+        my @f = split /\t/;
+        ($chr,$s,$e,$id) = ($f[0],$f[1],$f[2],$f[3]);
+    }
+    if ($minlen !=0 ){
+        next if ($e-$s<$minlen);
+    }
+    my ($s1,$e1,$s2,$e2);
+    if ($range eq "all"){
+        $s1 = $s-$bp;
+        $e1 = $s+$bp;
+        $s2 = $e-$bp;
+        $e2 = $e+$bp;
+    } else {
+        $s1 = $s-$bp;
+        $e1 = $s;
+        $s2 = $e;
+        $e2 = $e+$bp;
+    }
+    my $len = $range eq "all"? $bp * 2: $bp;
+    my $seq1 = $db->seq("$chr:$s1-$e1");
+    my $seq2 = $db->seq("$chr:$s2-$e2");
+    open (OUT1, ">/tmp/seq1.fa");
+    open (OUT2, ">/tmp/seq2.fa");
+    print OUT1 ">lf\n$seq1\n";
+    print OUT2 ">rf\n$seq2\n";
+    close OUT1; close OUT2;
+    my $bl2seqoutfile = "/tmp/bl2seq.out";
+    system("$locate_bl2seq -i /tmp/seq1.fa -j /tmp/seq2.fa -p blastn -q-1 -e $evalue -W 7 -F F -D 1 -o $bl2seqoutfile");
+    open(BLASTOUT,"$bl2seqoutfile") or die "Can not open $bl2seqoutfile:$!\n";
+    my ($seq1s, $seq1e, $seq2s, $seq2e,$sim);
+    my $flag=0;
+    while (<BLASTOUT>){
+        my $line =$_;
+        chomp($line);
+        next if ($line=~/^\#/);
+        my @g = split(/\t/,$line);
+        next if ($g[2]<$similarity);
+        ($seq1s, $seq1e, $seq2s, $seq2e,$sim) = ($g[6],$g[7],$g[8],$g[9],$g[2]);
+        if ($R eq "f"){
+            next if ((($seq1s-$seq1e)>0 && ($seq2s-$seq2e<0)) || (($seq1s-$seq1e)<0 && ($seq2s-$seq2e)>0));
+        }
+        next if (abs(abs($bp-1-$seq1e)-$seq2s)>$distance_disparity);
+        $flag=1;
+        last;
+    }
+    if ($flag==1){
+        my $lfpos1 = $s1+$seq1s; my $lfpos2 = $s1+$seq1e-1;
+        my $rfpos1 = $s2+$seq2s; my $rfpos2 = $s2+$seq2e-1;
+        my @lf_arr = split //, $seq1;
+        my @rf_arr = split //, $seq2;
+        my @ucltsd = @lf_arr[$seq1s..$seq1e-1];
+        my @ucrtsd = @rf_arr[$seq2s..$seq2e-1];
+        print OUT "$id\t$chr\t".$#ucltsd."\t$lfpos1\t$lfpos2\t$s\t$e\t$rfpos1\t$rfpos2\t$sim\t".join ("",@ucltsd)."\t".join("",@ucrtsd)."\t$#ucrtsd\n";
+    }
+}
+close OUT;
+print STDERR "$outfile created\n";
